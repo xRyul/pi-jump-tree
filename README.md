@@ -1,6 +1,12 @@
 # pi-jump-tree
 
-Each Pi session has a session ID, and each leaf/node in the session tree has an entry ID. This extension shows both in the footer so you can copy a portable jump target.
+Easily jump between sessions and tree leaves.
+
+Each Pi session has a session ID, and each leaf/node in the session tree has an entry ID. This extension shows both in the footer so you can copy and then easily come back to it via e.g.: `/jump <session-id>:<leaf-entry-id>`.
+
+## Demo
+
+![pi-jump-tree demo](https://raw.githubusercontent.com/xRyul/pi-jump-tree/v0.1.1/demo.png)
 
 Footer format:
 

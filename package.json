@@ -1,6 +1,6 @@
 {
   "name": "pi-jump-tree",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Pi extension for showing the current session tree leaf ID and jumping to entries by ID or label.",
   "license": "MIT",
@@ -19,7 +19,8 @@
     "navigation"
   ],
   "files": [
-    "index.ts"
+    "index.ts",
+    "demo.png"
   ],
   "publishConfig": {
     "access": "public"
@@ -27,7 +28,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/xRyul/pi-jump-tree/v0.1.1/demo.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
