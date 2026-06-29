@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+
 import {
     SessionManager,
     type ExtensionAPI,
@@ -11,6 +13,9 @@ const STATUS_KEY = "pi-jump-tree";
 const LEGACY_WIDGET_KEY = "pi-jump-tree-info";
 const MAX_SELECT_MATCHES = 60;
 const MAX_COMPLETIONS = 80;
+const STARTUP_JUMP_FLAG = "jump";
+const SESSION_VALUE_FLAGS = new Set(["--session", "--fork", "--session-id"]);
+const SESSION_BOOLEAN_FLAGS = new Set(["--continue", "-c", "--resume", "-r", "--no-session"]);
 
 type NotifyLevel = "info" | "warning" | "error";
 type MatchReason = "id" | "mark";
@@ -482,6 +487,113 @@ async function navigateToMatch(match: EntryMatch, ctx: ExtensionCommandContext):
     notify(ctx, `Jumped to ${target}`, "info");
 }
 
+function failStartupJump(message: string): never {
+    console.error(`[pi-jump-tree] ${message}`);
+    process.exit(1);
+}
+
+function getStartupJumpValue(pi: ExtensionAPI): string | undefined {
+    const value = pi.getFlag(STARTUP_JUMP_FLAG);
+    if (value === undefined || value === false) return undefined;
+
+    if (typeof value !== "string" || value.trim().length === 0) {
+        failStartupJump("Usage: pi --jump <session-id>:<entry-id-or-mark>");
+    }
+
+    return value.trim();
+}
+
+function stripStartupJumpRelaunchArgs(args: string[]): string[] {
+    const result: string[] = [];
+
+    for (let index = 0; index < args.length; index++) {
+        const arg = args[index];
+        if (!arg) continue;
+
+        if (arg === `--${STARTUP_JUMP_FLAG}`) {
+            index++;
+            continue;
+        }
+
+        if (arg.startsWith(`--${STARTUP_JUMP_FLAG}=`)) continue;
+
+        if (SESSION_VALUE_FLAGS.has(arg)) {
+            index++;
+            continue;
+        }
+
+        if ([...SESSION_VALUE_FLAGS].some((flag) => arg.startsWith(`${flag}=`))) continue;
+        if (SESSION_BOOLEAN_FLAGS.has(arg)) continue;
+
+        result.push(arg);
+    }
+
+    return result;
+}
+
+function chooseStartupSessionTarget(matches: SessionTarget[], selector: string): SessionTarget | undefined {
+    const exactMatches = matches.filter((target) => target.id === selector);
+    const candidates = exactMatches.length > 0 ? exactMatches : matches;
+    return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function formatStartupSessionMatches(matches: SessionTarget[]): string {
+    return matches
+        .slice(0, 10)
+        .map((match) => `  ${formatSessionChoice(match)}`)
+        .join("\n");
+}
+
+function relaunchPiForStartupJump(sessionTarget: SessionTarget, parsed: QualifiedJumpTarget): never {
+    if (!sessionTarget.path) {
+        failStartupJump(`Session ${sessionTarget.id} has no file path to open`);
+    }
+
+    const jumpTarget = `${sessionTarget.id}:${parsed.targetSelector}`;
+    const passthroughArgs = stripStartupJumpRelaunchArgs(process.argv.slice(2));
+    const childCliArgs = ["--session", sessionTarget.path, `/jump ${jumpTarget}`, ...passthroughArgs];
+    const executable = process.argv[0];
+    const script = process.argv[1];
+    const childArgs = script ? [script, ...childCliArgs] : childCliArgs;
+
+    const result = spawnSync(executable, childArgs, {
+        cwd: process.cwd(),
+        env: process.env,
+        stdio: "inherit",
+    });
+
+    if (result.error) {
+        failStartupJump(`Failed to launch target session: ${result.error.message}`);
+    }
+
+    if (result.signal) {
+        failStartupJump(`Target session exited from signal ${result.signal}`);
+    }
+
+    process.exit(result.status ?? 0);
+}
+
+async function handleStartupJumpFlag(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+    const rawTarget = getStartupJumpValue(pi);
+    if (!rawTarget) return;
+
+    const parsed = parseQualifiedJumpTarget(rawTarget);
+    if (!parsed || !parsed.targetSelector) {
+        failStartupJump("Usage: pi --jump <session-id>:<entry-id-or-mark>");
+    }
+
+    setJumpProgressStatus(ctx, `opening ${parsed.sessionSelector}`);
+    const matches = await findSessionTargets(parsed.sessionSelector, ctx);
+    const sessionTarget = chooseStartupSessionTarget(matches, parsed.sessionSelector);
+
+    if (!sessionTarget) {
+        const suffix = matches.length > 0 ? `\nMatches:\n${formatStartupSessionMatches(matches)}` : "";
+        failStartupJump(`No unique session ID found matching: ${parsed.sessionSelector}${suffix}`);
+    }
+
+    relaunchPiForStartupJump(sessionTarget, parsed);
+}
+
 export default function piJumpTree(pi: ExtensionAPI): void {
     let latestContext: ExtensionContext | undefined;
 
@@ -491,7 +603,15 @@ export default function piJumpTree(pi: ExtensionAPI): void {
         updateStatus(ctx);
     }
 
-    pi.on("session_start", async (_event, ctx) => rememberContext(ctx));
+    pi.registerFlag(STARTUP_JUMP_FLAG, {
+        description: "Open <session-id>:<entry-id-or-mark> at startup",
+        type: "string",
+    });
+
+    pi.on("session_start", async (event, ctx) => {
+        rememberContext(ctx);
+        if (event.reason === "startup") await handleStartupJumpFlag(pi, ctx);
+    });
     pi.on("message_end", async (_event, ctx) => rememberContext(ctx));
     pi.on("session_tree", async (_event, ctx) => rememberContext(ctx));
     pi.on("session_compact", async (_event, ctx) => rememberContext(ctx));

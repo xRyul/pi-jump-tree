@@ -6,7 +6,7 @@ Each Pi session has a session ID, and each leaf/node in the session tree has an 
 
 ## Demo
 
-![pi-jump-tree demo](https://raw.githubusercontent.com/xRyul/pi-jump-tree/v0.1.1/demo.png)
+![pi-jump-tree demo](https://raw.githubusercontent.com/xRyul/pi-jump-tree/v0.2.0/demo.png)
 
 Footer format:
 
@@ -15,6 +15,14 @@ Footer format:
 ```
 
 Use that value directly with `/jump` to reopen the session and navigate to that leaf.
+
+Open Pi directly at a saved target with:
+
+```bash
+pi --jump <session-id>:<entry-id-or-mark>
+```
+
+The `--jump` flag resolves the session, starts Pi with that session, then runs the same `/jump` navigation before you continue working.
 
 ## Commands
 
@@ -28,6 +36,7 @@ Use that value directly with `/jump` to reopen the session and navigate to that 
 ## Examples
 
 ```text
+pi --jump 019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4
 /jump 019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4
 /jump 019efa01-049b-7ee0-be17-6969205499de:release-checkpoint
 /jump a1b2c3d4
