@@ -291,6 +291,33 @@ function notify(ctx: ExtensionContext, message: string, level: NotifyLevel = "in
     if (ctx.hasUI) ctx.ui.notify(message, level);
 }
 
+function stripTerminalArtifacts(value: string): string {
+    return value
+        .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+        .replace(/[\u200B-\u200D\uFEFF]/g, "")
+        .replace(/[\x00-\x1f\x7f]+/g, "")
+        .trim();
+}
+
+function sessionIdMatchKey(value: string): string {
+    return stripTerminalArtifacts(value).replace(/-/g, "").toLowerCase();
+}
+
+function sessionIdMatches(id: string, selector: string): boolean {
+    const cleanedSelector = stripTerminalArtifacts(selector);
+    if (!cleanedSelector) return false;
+    if (id === cleanedSelector || id.startsWith(cleanedSelector)) return true;
+
+    const idKey = sessionIdMatchKey(id);
+    const selectorKey = sessionIdMatchKey(cleanedSelector);
+    return selectorKey.length > 0 && idKey.startsWith(selectorKey);
+}
+
+function sessionIdEquals(id: string, selector: string): boolean {
+    const cleanedSelector = stripTerminalArtifacts(selector);
+    return id === cleanedSelector || sessionIdMatchKey(id) === sessionIdMatchKey(cleanedSelector);
+}
+
 function stripForOneLine(value: string, maxLength = 96): string {
     const normalized = value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
     if (normalized.length <= maxLength) return normalized;
@@ -358,7 +385,7 @@ function formatEntryChoice(entry: SessionEntry, ctx: ExtensionContext, reason?: 
 }
 
 function findEntryMatches(rawQuery: string, ctx: ExtensionContext): EntryMatch[] {
-    const query = rawQuery.trim();
+    const query = stripTerminalArtifacts(rawQuery);
     if (!query) return [];
 
     const entries = ctx.sessionManager.getEntries();
@@ -371,7 +398,7 @@ function findEntryMatches(rawQuery: string, ctx: ExtensionContext): EntryMatch[]
 }
 
 function normalizeMarkQuery(rawQuery: string): string {
-    const query = rawQuery.trim();
+    const query = stripTerminalArtifacts(rawQuery);
     if (query.startsWith("mark:")) return query.slice("mark:".length).trim();
     if (query.startsWith("label:")) return query.slice("label:".length).trim();
     if (query.startsWith("#")) return query.slice(1).trim();
@@ -397,7 +424,7 @@ function findMarkMatches(rawQuery: string, ctx: ExtensionContext): EntryMatch[] 
 }
 
 function findAnyMatches(rawQuery: string, ctx: ExtensionContext): EntryMatch[] {
-    const query = rawQuery.trim();
+    const query = stripTerminalArtifacts(rawQuery);
     if (!query) return [];
 
     if (query.startsWith("mark:") || query.startsWith("label:") || query.startsWith("#")) {
@@ -518,13 +545,13 @@ function anyCompletions(prefix: string, ctx?: ExtensionContext): CompletionItem[
 }
 
 function parseQualifiedJumpTarget(rawQuery: string): QualifiedJumpTarget | undefined {
-    const query = rawQuery.trim();
+    const query = stripTerminalArtifacts(rawQuery);
     const separatorIndex = query.indexOf(":");
     if (separatorIndex <= 0) return undefined;
 
     return {
-        sessionSelector: query.slice(0, separatorIndex).trim(),
-        targetSelector: query.slice(separatorIndex + 1).trim(),
+        sessionSelector: stripTerminalArtifacts(query.slice(0, separatorIndex)),
+        targetSelector: stripTerminalArtifacts(query.slice(separatorIndex + 1)),
     };
 }
 
@@ -565,7 +592,7 @@ async function listKnownSessions(ctx: ExtensionContext): Promise<SessionInfo[]> 
 }
 
 async function findSessionTargets(rawSelector: string, ctx: ExtensionContext): Promise<SessionTarget[]> {
-    const selector = rawSelector.trim();
+    const selector = stripTerminalArtifacts(rawSelector);
     if (!selector) return [];
 
     const targets = new Map<string, SessionTarget>();
@@ -574,7 +601,7 @@ async function findSessionTargets(rawSelector: string, ctx: ExtensionContext): P
     };
 
     const currentId = ctx.sessionManager.getSessionId();
-    if (currentId === selector || currentId.startsWith(selector)) {
+    if (sessionIdMatches(currentId, selector)) {
         addTarget({
             current: true,
             id: currentId,
@@ -583,10 +610,10 @@ async function findSessionTargets(rawSelector: string, ctx: ExtensionContext): P
             cwd: ctx.cwd,
         });
     }
-    if (currentId === selector) return [...targets.values()];
+    if (sessionIdEquals(currentId, selector)) return [...targets.values()];
 
     for (const session of await listKnownSessions(ctx)) {
-        if (session.id === selector || session.id.startsWith(selector)) {
+        if (sessionIdMatches(session.id, selector)) {
             addTarget({
                 current: session.id === currentId || session.path === ctx.sessionManager.getSessionFile(),
                 cwd: session.cwd,
@@ -598,7 +625,7 @@ async function findSessionTargets(rawSelector: string, ctx: ExtensionContext): P
     }
 
     const matches = [...targets.values()];
-    const exactMatches = matches.filter((target) => target.id === selector);
+    const exactMatches = matches.filter((target) => sessionIdEquals(target.id, selector));
     return exactMatches.length > 0 ? exactMatches : matches;
 }
 
@@ -667,9 +694,28 @@ async function jumpToQualifiedTarget(parsed: QualifiedJumpTarget, ctx: Extension
     );
     if (!sessionTarget) return;
 
-    const jumpInsideSession = async (targetCtx: ExtensionCommandContext): Promise<void> => {
+    const jumpInsideSession = async (
+        targetCtx: ExtensionCommandContext,
+        options: { reloadFromFileOnMiss?: boolean } = {},
+    ): Promise<void> => {
         const matches = targetMatchesInSession(parsed.targetSelector, targetCtx);
         if (matches.length === 0) {
+            const reloadPath = sessionTarget.path ?? targetCtx.sessionManager.getSessionFile();
+            if (options.reloadFromFileOnMiss && reloadPath) {
+                setJumpProgressStatus(targetCtx, `reloading ${sessionTarget.id}`);
+                const result = await targetCtx.switchSession(reloadPath, {
+                    withSession: async (reloadedCtx) => {
+                        await jumpInsideSession(reloadedCtx, { reloadFromFileOnMiss: false });
+                    },
+                });
+
+                if (result.cancelled) {
+                    updateStatus(targetCtx);
+                    notify(targetCtx, `Reload of session ${sessionTarget.id} cancelled`, "warning");
+                }
+                return;
+            }
+
             updateStatus(targetCtx);
             notify(targetCtx, `No entry ID or mark found matching: ${parsed.targetSelector}`, "warning");
             return;
@@ -690,7 +736,7 @@ async function jumpToQualifiedTarget(parsed: QualifiedJumpTarget, ctx: Extension
         || (sessionTarget.path !== undefined && sessionTarget.path === currentSessionFile);
 
     if (isCurrentSession) {
-        await jumpInsideSession(ctx);
+        await jumpInsideSession(ctx, { reloadFromFileOnMiss: true });
         return;
     }
 

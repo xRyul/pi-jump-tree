@@ -52,6 +52,12 @@ Qualified jump targets are portable across projects. For example:
 ```
 
 The part before `:` is matched against known Pi session IDs, including sessions outside the current working directory. If a matching session file is found, the extension switches to that session, then resolves the part after `:` as an entry ID or mark inside that session.
+Session ID matching is dash-insensitive, so UUID-style IDs work with or without dashes. These are equivalent:
+
+```text
+/jump 019efa01-049b-7ee0-be17-6969205499de:ec619574
+/jump 019efa01049b7ee0be176969205499de:ec619574
+```
 
 Session lookup searches Pi's default session store and the current session manager's session directory. If multiple sessions match a prefix, Pi asks you to choose. Autocomplete is current-session only, so cross-session targets may need to be pasted or typed manually.
 
