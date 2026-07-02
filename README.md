@@ -63,6 +63,135 @@ jump scanning all sessions [42/180 · 23%]
 
 It then restores the usual `<session-id>:<leaf-entry-id>` footer once lookup finishes or the jump completes.
 
+## Runtime restore registry
+
+This extension also publishes a small **runtime restore registry**. It is not an audit log, history store, or backup. It is a live mapping that answers:
+
+> Given this terminal pane's TTY, what `pi --jump ...` command would reopen the Pi conversation branch currently running in that pane?
+
+This lets terminal workspace tools restore Pi panes after a terminal restart. The tool snapshots the command while Pi is still running, stores it in its own workspace save file, then replays it when recreating the pane.
+
+### Behavioral contract
+
+While a Pi process using this extension is alive:
+
+- `instances/<pid>.json` describes that Pi process.
+- If Pi can detect its terminal TTY, `by-tty/<sanitized-tty>.json` describes the Pi process currently associated with that TTY.
+- `sessionId` is the Pi session ID.
+- `leafId` is the current session-tree leaf.
+- If `leafId` is not `null`, `jumpCommand` is equivalent to:
+
+  ```bash
+  pi --jump <sessionId>:<leafId>
+  ```
+
+- The registry is refreshed on session start, message/turn/agent completion, tree navigation, compaction, and session rename.
+- Refreshes are debounced and skipped when the restore target has not changed, so `updatedAt` does not cause constant disk writes.
+- On session shutdown, the per-PID file is removed. The per-TTY file is removed only if it still belongs to the same process.
+- Stale files for dead PIDs are cleaned during startup.
+
+Important invariant: the registry represents **current live pane state only**. A restore tool should read it at **workspace save time**, not at restore time, because after a reboot or terminal restart the original Pi process and its registry file may be gone.
+
+### Registry files
+
+```text
+~/.pi/agent/logs/pi-jump-tree/runtime/instances/<pid>.json
+~/.pi/agent/logs/pi-jump-tree/runtime/by-tty/<sanitized-tty>.json
+```
+
+TTY keys remove a leading `/dev/` and replace non-`[A-Za-z0-9._-]` characters with `_`. For example, `/dev/ttys007` becomes `ttys007.json`.
+
+Example entry:
+
+```json
+{
+  "schemaVersion": 1,
+  "pid": 21651,
+  "tty": "/dev/ttys007",
+  "cwd": "/Users/<username>/project",
+  "sessionId": "019efa01-049b-7ee0-be17-6969205499de",
+  "leafId": "a1b2c3d4",
+  "sessionFile": "/Users/<username>/.pi/agent/sessions/...jsonl",
+  "sessionName": "optional",
+  "jumpTarget": "019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4",
+  "jumpCommand": "pi --jump 019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4",
+  "updatedAt": "2026-07-02T17:00:00.000Z"
+}
+```
+
+If a session has no current leaf yet, `leafId` is `null` and no `jumpCommand` is written.
+
+### How users benefit
+
+The registry makes Pi sessions restorable by other automation. For example, a WezTerm workspace restore plugin can:
+
+1. Save the WezTerm window/tab/pane layout.
+2. For each pane, look up the pane's TTY in this registry.
+3. If the pane contains Pi, save `jumpCommand` next to the pane's `cwd`.
+4. Later, recreate the pane and run `jumpCommand`.
+
+Result: after closing or restarting the terminal, the restored pane can reopen the same Pi session and tree leaf automatically:
+
+```bash
+pi --jump 019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4
+```
+
+You can also use it manually for debugging:
+
+```bash
+cat ~/.pi/agent/logs/pi-jump-tree/runtime/by-tty/ttys007.json | jq .jumpCommand
+```
+
+Then run the printed command in a new terminal pane.
+
+### Tool integration contract
+
+A terminal restore tool should use the registry like this:
+
+1. At **save time**, get the pane's TTY from the terminal emulator.
+   - WezTerm example: `pane:get_tty_name()` returns values like `/dev/ttys007`.
+2. Convert the TTY to the same sanitized key described above.
+3. Read `~/.pi/agent/logs/pi-jump-tree/runtime/by-tty/<sanitized-tty>.json`.
+4. If `schemaVersion === 1` and `jumpCommand` exists, save Pi restore metadata into the tool's own workspace state.
+5. At **restore time**, create the pane in the saved `cwd` and send/run the saved command.
+6. If no registry file or no `jumpCommand` exists, fall back to normal terminal restore behavior.
+
+Minimal saved-pane metadata:
+
+```json
+{
+  "cwd": "/Users/<username>/project",
+  "restore": {
+    "type": "pi-jump",
+    "sessionId": "019efa01-049b-7ee0-be17-6969205499de",
+    "leafId": "a1b2c3d4",
+    "command": "pi --jump 019efa01-049b-7ee0-be17-6969205499de:a1b2c3d4"
+  }
+}
+```
+
+Pseudo-code:
+
+```text
+tty = pane.tty_name
+key = sanitize_tty(tty)
+entry = read_json("~/.pi/agent/logs/pi-jump-tree/runtime/by-tty/" + key + ".json")
+
+if entry.schemaVersion == 1 and entry.jumpCommand exists:
+  savedPane.restore = {
+    type: "pi-jump",
+    sessionId: entry.sessionId,
+    leafId: entry.leafId,
+    command: entry.jumpCommand
+  }
+
+# Later, during restore:
+if savedPane.restore.type == "pi-jump":
+  send_text(savedPane.restore.command + "\r\n")
+```
+
+Consumers should prefer `by-tty` files for pane lookup. The `instances/<pid>.json` files are mainly for diagnostics or process-oriented discovery. Treat registry files as local trusted metadata; if your restore tool supports untrusted workspace files, construct the command from `sessionId` and `leafId` rather than blindly executing arbitrary saved text.
+
 ## Notes
 
 Marks are stored as Pi session labels in the session JSONL file. They are session-scoped, not global.

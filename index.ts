@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import {
+    getAgentDir,
     SessionManager,
     type ExtensionAPI,
     type ExtensionCommandContext,
@@ -16,6 +19,12 @@ const MAX_COMPLETIONS = 80;
 const STARTUP_JUMP_FLAG = "jump";
 const SESSION_VALUE_FLAGS = new Set(["--session", "--fork", "--session-id"]);
 const SESSION_BOOLEAN_FLAGS = new Set(["--continue", "-c", "--resume", "-r", "--no-session"]);
+const RUNTIME_REGISTRY_SCHEMA_VERSION = 1;
+const RUNTIME_REGISTRY_DIR = join(getAgentDir(), "logs", "pi-jump-tree", "runtime");
+const RUNTIME_INSTANCES_DIR = join(RUNTIME_REGISTRY_DIR, "instances");
+const RUNTIME_BY_TTY_DIR = join(RUNTIME_REGISTRY_DIR, "by-tty");
+const REGISTRY_REFRESH_DEBOUNCE_MS = 25;
+const POST_SESSION_WRITE_REFRESH_DELAYS_MS = [0, 50, 250, 1000] as const;
 
 type NotifyLevel = "info" | "warning" | "error";
 type MatchReason = "id" | "mark";
@@ -42,6 +51,240 @@ interface SessionTarget {
     id: string;
     name?: string;
     path?: string;
+}
+
+interface RuntimeInstanceRegistryEntry {
+    schemaVersion: typeof RUNTIME_REGISTRY_SCHEMA_VERSION;
+    pid: number;
+    tty?: string;
+    cwd: string;
+    sessionId: string;
+    leafId: string | null;
+    sessionFile: string | null;
+    sessionName?: string;
+    jumpTarget?: string;
+    jumpCommand?: string;
+    updatedAt: string;
+}
+
+interface RuntimeRegistryPaths {
+    instancePath: string;
+    byTtyPath?: string;
+}
+
+interface RuntimeRegistryWriteResult {
+    paths: RuntimeRegistryPaths;
+    signature: string;
+}
+
+let detectedTtyName: string | null | undefined;
+
+function normalizeTtyName(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === "not a tty" || trimmed === "??") return undefined;
+
+    if (trimmed.startsWith("/dev/")) return trimmed;
+    if (trimmed.startsWith("tty") || trimmed.startsWith("pts/")) return `/dev/${trimmed}`;
+    return trimmed;
+}
+
+function detectTtyNameWithFd(fd: number): string | undefined {
+    try {
+        const result = spawnSync("tty", [], {
+            encoding: "utf8",
+            stdio: [fd, "pipe", "ignore"],
+            timeout: 1000,
+        });
+        if (result.status !== 0) return undefined;
+        return normalizeTtyName(result.stdout);
+    } catch {
+        return undefined;
+    }
+}
+
+function detectTtyName(): string | undefined {
+    if (detectedTtyName !== undefined) return detectedTtyName ?? undefined;
+
+    detectedTtyName = normalizeTtyName(process.env.TTY)
+        ?? detectTtyNameWithFd(0)
+        ?? detectTtyNameWithFd(1)
+        ?? detectTtyNameWithFd(2)
+        ?? null;
+
+    return detectedTtyName ?? undefined;
+}
+
+function sanitizeRegistryKey(value: string): string {
+    const withoutDevicePrefix = value.trim().replace(/^\/dev\//, "");
+    const sanitized = withoutDevicePrefix
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+    return sanitized || "unknown";
+}
+
+function runtimeRegistryPathsFor(tty = detectTtyName()): RuntimeRegistryPaths {
+    return {
+        instancePath: join(RUNTIME_INSTANCES_DIR, `${process.pid}.json`),
+        byTtyPath: tty ? join(RUNTIME_BY_TTY_DIR, `${sanitizeRegistryKey(tty)}.json`) : undefined,
+    };
+}
+
+function buildRuntimeRegistryEntry(
+    ctx: ExtensionContext,
+    knownSessionName?: string | null,
+    updatedAt = new Date().toISOString(),
+): RuntimeInstanceRegistryEntry {
+    const tty = detectTtyName();
+    const sessionId = ctx.sessionManager.getSessionId();
+    const leafId = ctx.sessionManager.getLeafId() ?? null;
+    const jumpTarget = leafId ? `${sessionId}:${leafId}` : undefined;
+    const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+    const sessionName = knownSessionName === undefined
+        ? ctx.sessionManager.getSessionName()
+        : knownSessionName ?? undefined;
+
+    return {
+        schemaVersion: RUNTIME_REGISTRY_SCHEMA_VERSION,
+        pid: process.pid,
+        ...(tty ? { tty } : {}),
+        cwd: ctx.cwd,
+        sessionId,
+        leafId,
+        sessionFile,
+        ...(sessionName ? { sessionName } : {}),
+        ...(jumpTarget ? { jumpTarget, jumpCommand: `pi --jump ${jumpTarget}` } : {}),
+        updatedAt,
+    };
+}
+
+function runtimeRegistrySignature(entry: RuntimeInstanceRegistryEntry): string {
+    return JSON.stringify({
+        schemaVersion: entry.schemaVersion,
+        pid: entry.pid,
+        tty: entry.tty ?? null,
+        cwd: entry.cwd,
+        sessionId: entry.sessionId,
+        leafId: entry.leafId,
+        sessionFile: entry.sessionFile,
+        sessionName: entry.sessionName ?? null,
+        jumpTarget: entry.jumpTarget ?? null,
+        jumpCommand: entry.jumpCommand ?? null,
+    });
+}
+
+let atomicWriteCounter = 0;
+
+async function writeJsonAtomically(path: string, data: unknown): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    const nonce = `${process.pid}.${Date.now()}.${++atomicWriteCounter}`;
+    const temporaryPath = `${path}.${nonce}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    await rename(temporaryPath, path);
+}
+
+async function writeRuntimeRegistry(
+    ctx: ExtensionContext,
+    previousSignature?: string,
+    knownSessionName?: string | null,
+): Promise<RuntimeRegistryWriteResult> {
+    const entry = buildRuntimeRegistryEntry(ctx, knownSessionName);
+    const signature = runtimeRegistrySignature(entry);
+    const paths = runtimeRegistryPathsFor(entry.tty);
+
+    if (signature === previousSignature) return { paths, signature };
+
+    await writeJsonAtomically(paths.instancePath, entry);
+    if (paths.byTtyPath) await writeJsonAtomically(paths.byTtyPath, entry);
+
+    return { paths, signature };
+}
+
+async function readRuntimeRegistryEntry(path: string): Promise<RuntimeInstanceRegistryEntry | undefined> {
+    try {
+        const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<RuntimeInstanceRegistryEntry>;
+        return typeof parsed.pid === "number" ? parsed as RuntimeInstanceRegistryEntry : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function removeByTtyRegistryIfOwned(path: string): Promise<void> {
+    const current = await readRuntimeRegistryEntry(path);
+    if (!current || current.pid === process.pid) await rm(path, { force: true });
+}
+
+async function removeRuntimeRegistry(paths: RuntimeRegistryPaths): Promise<void> {
+    await rm(paths.instancePath, { force: true });
+    if (paths.byTtyPath) await removeByTtyRegistryIfOwned(paths.byTtyPath);
+}
+
+function hasNodeErrorCode(error: unknown, code: string): boolean {
+    return typeof error === "object"
+        && error !== null
+        && "code" in error
+        && (error as { code?: unknown }).code === code;
+}
+
+async function readRegistryDirectory(path: string): Promise<string[]> {
+    try {
+        return await readdir(path);
+    } catch (error) {
+        if (hasNodeErrorCode(error, "ENOENT")) return [];
+        throw error;
+    }
+}
+
+function isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return hasNodeErrorCode(error, "EPERM");
+    }
+}
+
+async function cleanupStaleInstanceRegistries(): Promise<void> {
+    const files = await readRegistryDirectory(RUNTIME_INSTANCES_DIR);
+
+    await Promise.all(files.map(async (file) => {
+        const match = /^(\d+)\.json$/.exec(file);
+        if (!match) return;
+
+        const pid = Number(match[1]);
+        if (pid === process.pid || isProcessAlive(pid)) return;
+
+        await rm(join(RUNTIME_INSTANCES_DIR, file), { force: true });
+    }));
+}
+
+async function cleanupStaleByTtyRegistries(): Promise<void> {
+    const files = await readRegistryDirectory(RUNTIME_BY_TTY_DIR);
+
+    await Promise.all(files.map(async (file) => {
+        if (!file.endsWith(".json")) return;
+
+        const path = join(RUNTIME_BY_TTY_DIR, file);
+        const entry = await readRuntimeRegistryEntry(path);
+        if (!entry || entry.pid === process.pid || isProcessAlive(entry.pid)) return;
+
+        await rm(path, { force: true });
+    }));
+}
+
+async function cleanupStaleRuntimeRegistry(): Promise<void> {
+    await Promise.all([
+        cleanupStaleInstanceRegistries(),
+        cleanupStaleByTtyRegistries(),
+    ]);
+}
+
+function logRuntimeRegistryError(action: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[pi-jump-tree] Failed to ${action} runtime registry: ${message}`);
 }
 
 function notify(ctx: ExtensionContext, message: string, level: NotifyLevel = "info"): void {
@@ -80,7 +323,7 @@ function entryKind(entry: SessionEntry): string {
 function entryPreview(entry: SessionEntry): string {
     switch (entry.type) {
         case "message":
-            return stripForOneLine(stringifyContent(entry.message.content));
+            return stripForOneLine("content" in entry.message ? stringifyContent(entry.message.content) : "");
         case "custom_message":
             return stripForOneLine(stringifyContent(entry.content));
         case "compaction":
@@ -596,11 +839,125 @@ async function handleStartupJumpFlag(pi: ExtensionAPI, ctx: ExtensionContext): P
 
 export default function piJumpTree(pi: ExtensionAPI): void {
     let latestContext: ExtensionContext | undefined;
+    let latestRegistryPaths: RuntimeRegistryPaths | undefined;
+    let latestRegistrySignature: string | undefined;
+    let latestSessionName: string | undefined;
+    let pendingRegistryContext: ExtensionContext | undefined;
+    let pendingRegistryTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingPostSessionWriteContext: ExtensionContext | undefined;
+    const postSessionWriteTimers = new Map<number, ReturnType<typeof setTimeout>>();
+    let registryWriteQueue: Promise<void> = Promise.resolve();
+    let sessionGeneration = 0;
+    let staleCleanupStarted = false;
 
-    function rememberContext(ctx: ExtensionContext): void {
+    function applyContext(ctx: ExtensionContext): void {
         latestContext = ctx;
         clearLegacyWidget(ctx);
         updateStatus(ctx);
+    }
+
+    function enqueueRegistryWrite(ctx: ExtensionContext, generation = sessionGeneration): Promise<void> {
+        registryWriteQueue = registryWriteQueue
+            .catch(() => undefined)
+            .then(async () => {
+                if (generation !== sessionGeneration) return;
+
+                try {
+                    const result = await writeRuntimeRegistry(
+                        ctx,
+                        latestRegistrySignature,
+                        latestSessionName ?? null,
+                    );
+                    if (generation !== sessionGeneration) return;
+
+                    latestRegistryPaths = result.paths;
+                    latestRegistrySignature = result.signature;
+                } catch (error) {
+                    logRuntimeRegistryError("write", error);
+                }
+            });
+
+        return registryWriteQueue;
+    }
+
+    function cancelPendingRegistryWrite(): void {
+        if (pendingRegistryTimer) {
+            clearTimeout(pendingRegistryTimer);
+            pendingRegistryTimer = undefined;
+        }
+        pendingRegistryContext = undefined;
+    }
+
+    function cancelPostSessionWriteRefreshes(): void {
+        for (const timer of postSessionWriteTimers.values()) clearTimeout(timer);
+        postSessionWriteTimers.clear();
+        pendingPostSessionWriteContext = undefined;
+    }
+
+    function scheduleRegistryWrite(ctx: ExtensionContext): void {
+        pendingRegistryContext = ctx;
+        if (pendingRegistryTimer) return;
+
+        const generation = sessionGeneration;
+        pendingRegistryTimer = setTimeout(() => {
+            pendingRegistryTimer = undefined;
+            const nextContext = pendingRegistryContext;
+            pendingRegistryContext = undefined;
+
+            if (!nextContext || generation !== sessionGeneration) return;
+            void enqueueRegistryWrite(nextContext, generation);
+        }, REGISTRY_REFRESH_DEBOUNCE_MS);
+    }
+
+    async function rememberContext(
+        ctx: ExtensionContext,
+        options: { immediate?: boolean } = {},
+    ): Promise<void> {
+        applyContext(ctx);
+
+        if (options.immediate) {
+            cancelPendingRegistryWrite();
+            await enqueueRegistryWrite(ctx);
+            return;
+        }
+
+        scheduleRegistryWrite(ctx);
+    }
+
+    function rememberContextAfterSessionWrite(ctx: ExtensionContext): void {
+        pendingPostSessionWriteContext = ctx;
+        const generation = sessionGeneration;
+
+        // SessionManager appends messages after extension message_end handlers run.
+        // Keep one timer per delay and reset it on newer activity, so busy turns
+        // converge to one delayed refresh sequence instead of one sequence per event.
+        for (const delayMs of POST_SESSION_WRITE_REFRESH_DELAYS_MS) {
+            const existingTimer = postSessionWriteTimers.get(delayMs);
+            if (existingTimer) clearTimeout(existingTimer);
+
+            const timer = setTimeout(() => {
+                if (postSessionWriteTimers.get(delayMs) === timer) {
+                    postSessionWriteTimers.delete(delayMs);
+                }
+
+                const nextContext = pendingPostSessionWriteContext;
+                if (postSessionWriteTimers.size === 0) pendingPostSessionWriteContext = undefined;
+
+                if (!nextContext || generation !== sessionGeneration) return;
+                void rememberContext(nextContext);
+            }, delayMs);
+
+            postSessionWriteTimers.set(delayMs, timer);
+        }
+    }
+
+    function startStaleRegistryCleanup(): void {
+        if (staleCleanupStarted) return;
+        staleCleanupStarted = true;
+
+        void cleanupStaleRuntimeRegistry().catch((error) => {
+            logRuntimeRegistryError("clean stale", error);
+        });
     }
 
     pi.registerFlag(STARTUP_JUMP_FLAG, {
@@ -609,16 +966,47 @@ export default function piJumpTree(pi: ExtensionAPI): void {
     });
 
     pi.on("session_start", async (event, ctx) => {
-        rememberContext(ctx);
+        sessionGeneration++;
+        latestSessionName = ctx.sessionManager.getSessionName();
         if (event.reason === "startup") await handleStartupJumpFlag(pi, ctx);
+        await rememberContext(ctx, { immediate: true });
+        startStaleRegistryCleanup();
     });
-    pi.on("message_end", async (_event, ctx) => rememberContext(ctx));
-    pi.on("session_tree", async (_event, ctx) => rememberContext(ctx));
-    pi.on("session_compact", async (_event, ctx) => rememberContext(ctx));
+    pi.on("message_end", async (_event, ctx) => {
+        rememberContextAfterSessionWrite(ctx);
+    });
+    pi.on("turn_end", async (_event, ctx) => {
+        await rememberContext(ctx);
+        rememberContextAfterSessionWrite(ctx);
+    });
+    pi.on("agent_end", async (_event, ctx) => {
+        await rememberContext(ctx);
+        rememberContextAfterSessionWrite(ctx);
+    });
+    pi.on("session_tree", async (_event, ctx) => rememberContext(ctx, { immediate: true }));
+    pi.on("session_compact", async (_event, ctx) => rememberContext(ctx, { immediate: true }));
+    pi.on("session_info_changed", async (event, ctx) => {
+        latestSessionName = event.name;
+        await rememberContext(ctx, { immediate: true });
+    });
     pi.on("session_shutdown", async (_event, ctx) => {
+        sessionGeneration++;
         latestContext = undefined;
+        latestSessionName = undefined;
+        cancelPendingRegistryWrite();
+        cancelPostSessionWriteRefreshes();
         clearStatus(ctx);
         clearLegacyWidget(ctx);
+
+        try {
+            await registryWriteQueue.catch(() => undefined);
+            await removeRuntimeRegistry(latestRegistryPaths ?? runtimeRegistryPathsFor());
+        } catch (error) {
+            logRuntimeRegistryError("remove", error);
+        } finally {
+            latestRegistryPaths = undefined;
+            latestRegistrySignature = undefined;
+        }
     });
 
     pi.registerCommand("jump", {
